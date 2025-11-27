@@ -8,7 +8,15 @@ from typing import Any
 
 from homeassistant.components.switch import SwitchEntity, SwitchDeviceClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_TOKEN
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_MAC,
+    CONF_NAME,
+    CONF_PORT,
+    CONF_TOKEN,
+    STATE_ON,
+    STATE_OFF,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import DeviceInfo
@@ -25,6 +33,9 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Time to wait for TV to be ready after WOL
+TV_STARTUP_DELAY = 8  # seconds
 
 
 async def async_setup_entry(
@@ -83,7 +94,7 @@ async def async_setup_entry(
     
     # Create the switch entity
     async_add_entities([
-        FrameArtModeSwitch(entry, art_api, device_name, host),
+        FrameArtModeSwitch(hass, entry, art_api, device_name, host),
     ])
     
     _LOGGER.info("Frame Art Mode switch created for %s", device_name)
@@ -99,12 +110,14 @@ class FrameArtModeSwitch(SwitchEntity):
 
     def __init__(
         self,
+        hass: HomeAssistant,
         entry: ConfigEntry,
         art_api: SamsungTVAsyncArt,
         device_name: str,
         host: str,
     ) -> None:
         """Initialize the Art Mode switch."""
+        self._hass = hass
         self._entry = entry
         self._art_api = art_api
         self._device_name = device_name
@@ -113,6 +126,7 @@ class FrameArtModeSwitch(SwitchEntity):
         self._attr_is_on = None
         self._available = True
         self._updating = False
+        self._media_player_entity_id: str | None = None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -132,9 +146,102 @@ class FrameArtModeSwitch(SwitchEntity):
         """Return True if Art Mode is on."""
         return self._attr_is_on
 
+    def _get_media_player_entity_id(self) -> str | None:
+        """Get the media_player entity_id for this TV."""
+        if self._media_player_entity_id:
+            return self._media_player_entity_id
+        
+        # Find media_player entity for this config entry
+        entity_registry = self._hass.helpers.entity_registry.async_get(self._hass)
+        for entity in entity_registry.entities.values():
+            if (
+                entity.config_entry_id == self._entry.entry_id
+                and entity.domain == "media_player"
+            ):
+                self._media_player_entity_id = entity.entity_id
+                return entity.entity_id
+        
+        return None
+
+    async def _is_tv_on(self) -> bool:
+        """Check if TV is currently on."""
+        entity_id = self._get_media_player_entity_id()
+        if not entity_id:
+            return False
+        
+        state = self._hass.states.get(entity_id)
+        if state is None:
+            return False
+        
+        # TV is "on" if state is not off/unavailable
+        return state.state not in (STATE_OFF, "unavailable", "unknown")
+
+    async def _turn_on_tv(self) -> bool:
+        """Turn on the TV using media_player service."""
+        entity_id = self._get_media_player_entity_id()
+        if not entity_id:
+            _LOGGER.warning("Could not find media_player entity for %s", self._device_name)
+            return False
+        
+        _LOGGER.info("Turning on TV %s before activating Art Mode", entity_id)
+        
+        try:
+            await self._hass.services.async_call(
+                "media_player",
+                "turn_on",
+                {"entity_id": entity_id},
+                blocking=True,
+            )
+            return True
+        except Exception as ex:
+            _LOGGER.error("Failed to turn on TV: %s", ex)
+            return False
+
+    async def _wait_for_tv_ready(self, max_wait: int = 15) -> bool:
+        """Wait for TV to be ready after turning on."""
+        _LOGGER.debug("Waiting for TV to be ready (max %ds)...", max_wait)
+        
+        for i in range(max_wait):
+            await asyncio.sleep(1)
+            
+            # Try to connect to Art API
+            try:
+                async with asyncio.timeout(3):
+                    is_supported = await self._art_api.supported()
+                    if is_supported:
+                        _LOGGER.debug("TV ready after %d seconds", i + 1)
+                        return True
+            except Exception:
+                pass
+            
+            _LOGGER.debug("TV not ready yet, waiting... (%d/%d)", i + 1, max_wait)
+        
+        _LOGGER.warning("TV did not become ready within %d seconds", max_wait)
+        return False
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn Art Mode on."""
         _LOGGER.debug("Turning Art Mode ON for %s", self._device_name)
+        
+        # Check if TV is on
+        tv_is_on = await self._is_tv_on()
+        
+        if not tv_is_on:
+            _LOGGER.info("TV is off, turning it on first...")
+            
+            # Turn on TV
+            if not await self._turn_on_tv():
+                _LOGGER.error("Failed to turn on TV, cannot activate Art Mode")
+                return
+            
+            # Wait for TV to be ready
+            if not await self._wait_for_tv_ready(max_wait=20):
+                _LOGGER.warning("TV may not be fully ready, attempting Art Mode anyway...")
+            
+            # Additional delay for TV to stabilize
+            await asyncio.sleep(2)
+        
+        # Now activate Art Mode
         try:
             async with asyncio.timeout(10):
                 result = await self._art_api.set_artmode(True)
@@ -154,8 +261,18 @@ class FrameArtModeSwitch(SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn Art Mode off."""
+        """Turn Art Mode off (switch to normal TV mode)."""
         _LOGGER.debug("Turning Art Mode OFF for %s", self._device_name)
+        
+        # Check if TV is on
+        tv_is_on = await self._is_tv_on()
+        
+        if not tv_is_on:
+            _LOGGER.debug("TV is already off, Art Mode is already off")
+            self._attr_is_on = False
+            self.async_write_ha_state()
+            return
+        
         try:
             async with asyncio.timeout(10):
                 result = await self._art_api.set_artmode(False)
