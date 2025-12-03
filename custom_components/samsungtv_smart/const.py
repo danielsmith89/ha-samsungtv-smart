@@ -94,7 +94,6 @@ RESULT_SUCCESS = "success"
 RESULT_WRONG_APIKEY = "wrong_api_key"
 
 SERVICE_SELECT_PICTURE_MODE = "select_picture_mode"
-SERVICE_SET_ART_MODE = "set_art_mode"
 
 # Frame Art Extended Services
 SERVICE_ART_GET_ARTMODE = "art_get_artmode"

@@ -126,7 +126,6 @@ from .const import (
     SERVICE_ART_SET_SLIDESHOW,
     SERVICE_ART_UPLOAD,
     SERVICE_SELECT_PICTURE_MODE,
-    SERVICE_SET_ART_MODE,
     SIGNAL_CONFIG_ENTITY,
     STD_APP_LIST,
     WS_PREFIX,
@@ -229,11 +228,6 @@ async def async_setup_entry(
         SERVICE_SELECT_PICTURE_MODE,
         {vol.Required(ATTR_PICTURE_MODE): cv.string},
         "async_select_picture_mode",
-    )
-    platform.async_register_entity_service(
-        SERVICE_SET_ART_MODE,
-        {},
-        "async_set_art_mode",
     )
 
     # Frame Art Extended Services
