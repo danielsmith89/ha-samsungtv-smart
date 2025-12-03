@@ -99,7 +99,7 @@ data:
 - 80: High (morning/daytime)
 - 50: Medium (normal use)
 - 30: Low (evening)
-- 10: Minimum (night)
+- 0: Minimum (night)
 
 ---
 
@@ -148,7 +148,7 @@ data:
 
 ### `samsungtv_smart.art_slideshow`
 
-Start or stop artwork slideshow.
+Start or stop artwork slideshow, on some models works only for category : Personal
 
 **Parameters:**
 ```yaml
@@ -253,7 +253,7 @@ data:
 
 ### `samsungtv_smart.art_get_thumbnails_batch`
 
-Download thumbnails for multiple artworks at once.
+Download thumbnails for multiple artworks at once, note that if you set a favorite artwork with your smarthing app, the thumbnail will be available only after the artwork is displayed on your frame TV.
 
 **Parameters:**
 ```yaml
@@ -677,20 +677,57 @@ input_number:
     initial: 50
 
 input_select:
-  frame_matte_type:
-    name: Frame Type
+  frame_matte:
+    name: Style de cadre
     options:
       - none
-      - shadowbox
+      - shadowbox_polar
+      - shadowbox_black
+      - flexible_polar
+      - flexible_black
+      - modernthin_neutral
+      - modernthin_black
+    initial: shadowbox_polar
+    icon: mdi:border-style
+
+  frame_category:
+    name: Catégorie Frame
+    options:
+      - Mes Photos
+      - Favoris
+      - Tous
+    initial: Mes Photos    
+
+  frame_matte_type:
+    name: Type de cadre
+    options:
+      - none
+      - modernthin
       - modern
+      - modernwide
+      - shadowboxthin
+      - shadowbox
+      - shadowboxwide
+      - panoramic
       - flexible
 
   frame_matte_color:
-    name: Frame Color
+    name: Couleur de cadre
     options:
       - black
-      - white
+      - neutral
+      - antique
+      - warm
       - polar
+      - sand
+      - seafoam
+      - sage
+      - burgandy
+      - navy
+      - apricot
+      - byzantine
+      - lavender
+      - redorange
 ```
 
 ---
