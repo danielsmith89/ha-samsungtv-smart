@@ -15,7 +15,8 @@ Create interactive artwork galleries in Home Assistant with click-to-display fun
 - [Customization](#customization)
 - [Troubleshooting](#troubleshooting)
 
----
+--<img width="398" height="359" alt="image" src="https://github.com/user-attachments/assets/27a498f3-20eb-4d00-91a5-f7becb25c691" />
+-
 
 ## Overview
 
@@ -27,7 +28,7 @@ Frame Art Gallery transforms your Home Assistant dashboard into an interactive a
 - 📱 Fully responsive layouts
 - ⚡ Fast loading with cached thumbnails
 
-![Gallery Example](https://i.imgur.com/example.png)
+
 
 ---
 
