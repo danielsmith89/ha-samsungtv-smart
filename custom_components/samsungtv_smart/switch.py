@@ -299,6 +299,17 @@ class FrameArtModeSwitch(SwitchEntity):
         
         self._updating = True
         try:
+            # FIRST: Check if TV is powered off
+            tv_is_on = await self._is_tv_on()
+            
+            if not tv_is_on:
+                # TV is off, Art Mode must be off too
+                _LOGGER.debug("TV is off, setting Art Mode to off")
+                self._attr_is_on = False
+                self._available = True
+                return
+            
+            # TV is on, get actual Art Mode status
             async with asyncio.timeout(8):
                 art_mode = await self._art_api.get_artmode()
                 if art_mode is not None:
