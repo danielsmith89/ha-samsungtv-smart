@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_TOKEN
+from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_TOKEN, LIGHT_LUX
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import DeviceInfo
@@ -20,8 +21,16 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
+from pysmartthings import Attribute, Capability
+
 from .api.art import SamsungTVAsyncArt
 from .const import (
+    AUTH_METHOD_OAUTH,
+    AUTH_METHOD_ST_ENTRY,
+    CONF_API_KEY,
+    CONF_AUTH_METHOD,
+    CONF_DEVICE_ID,
+    CONF_OAUTH_TOKEN,
     CONF_WS_NAME,
     DATA_ART_API,
     DATA_CFG,
@@ -29,11 +38,12 @@ from .const import (
     DOMAIN,
     WS_PREFIX,
 )
+from . import async_get_samsungtv_api_key
 
 _LOGGER = logging.getLogger(__name__)
 
-# Update interval for the Frame Art sensor
-SCAN_INTERVAL = timedelta(seconds=30)
+# Update interval for the Frame Art sensor (reduced for faster manual updates)
+SCAN_INTERVAL = timedelta(seconds=15)
 
 
 async def async_setup_entry(
@@ -52,6 +62,8 @@ async def async_setup_entry(
     device_name = config.get(CONF_NAME) or entry.title or host
     
     session = async_get_clientsession(hass)
+    
+    entities = []
     
     # Create the Art API instance
     art_api = SamsungTVAsyncArt(
@@ -74,36 +86,170 @@ async def async_setup_entry(
         _LOGGER.debug("Frame TV support check failed: %s", ex)
         is_supported = False
     
-    if not is_supported:
+    if is_supported:
+        # Create www/frame_art directory if it doesn't exist
+        import os
+        www_path = hass.config.path("www", "frame_art")
+        try:
+            os.makedirs(www_path, exist_ok=True)
+            _LOGGER.debug("Frame Art directory ready: %s", www_path)
+        except Exception as ex:
+            _LOGGER.warning("Could not create frame_art directory: %s", ex)
+        
+        # Store art_api in hass.data for sharing with media_player
+        hass.data[DOMAIN][entry.entry_id][DATA_ART_API] = art_api
+        
+        # Create the coordinator
+        coordinator = FrameArtCoordinator(hass, art_api, entry)
+        
+        # Add Frame Art sensor
+        entities.append(FrameArtSensor(coordinator, entry, art_api, device_name))
+        
+        # Schedule first refresh in background (non-blocking)
+        hass.async_create_background_task(
+            coordinator.async_request_refresh(),
+            f"frame_art_initial_refresh_{entry.entry_id}",
+        )
+    else:
         _LOGGER.info("Frame TV art mode not supported on %s", host)
-        return
     
-    # Create www/frame_art directory if it doesn't exist
-    import os
-    www_path = hass.config.path("www", "frame_art")
-    try:
-        os.makedirs(www_path, exist_ok=True)
-        _LOGGER.debug("Frame Art directory ready: %s", www_path)
-    except Exception as ex:
-        _LOGGER.warning("Could not create frame_art directory: %s", ex)
+    # Add SmartThings sensors if SmartThings is configured
+    api_key = config.get(CONF_API_KEY)
+    device_id = config.get(CONF_DEVICE_ID)
+    auth_method = config.get(CONF_AUTH_METHOD)
     
-    # Store art_api in hass.data for sharing with media_player
-    hass.data[DOMAIN][entry.entry_id][DATA_ART_API] = art_api
+    # For OAuth, get token from oauth_token if api_key is not available
+    if auth_method == AUTH_METHOD_OAUTH and not api_key:
+        oauth_token = config.get(CONF_OAUTH_TOKEN)
+        if oauth_token and isinstance(oauth_token, dict):
+            api_key = oauth_token.get("access_token")
+            _LOGGER.debug("SmartThings sensors using OAuth token")
     
-    # Create the coordinator
-    coordinator = FrameArtCoordinator(hass, art_api, entry)
+    if api_key and device_id:
+        try:
+            # Create SmartThings client for initial setup
+            from pysmartthings import SmartThings
+            st_client = SmartThings(session=session)
+            st_client.authenticate(api_key)
+            
+            # Get the main TV device info
+            main_device = await st_client.get_device(device_id)
+            main_location_id = main_device.location_id
+            main_room_id = main_device.room_id
+            
+            _LOGGER.debug(
+                "Main TV device: %s (location: %s, room: %s)",
+                main_device.label,
+                main_location_id,
+                main_room_id,
+            )
+            
+            # Get ALL devices in the location
+            all_devices = await st_client.get_devices()
+            
+            # Find child devices (same location + parent_device_id or same room)
+            related_devices = []
+            for device in all_devices:
+                # Skip the main TV device
+                if device.device_id == device_id:
+                    continue
+                
+                # Check if it's a child device
+                is_child = (
+                    device.parent_device_id == device_id
+                    or (
+                        device.location_id == main_location_id
+                        and main_room_id
+                        and device.room_id == main_room_id
+                        and "light sensor" in device.label.lower()
+                    )
+                )
+                
+                if is_child:
+                    _LOGGER.debug(
+                        "Found related device: %s (parent: %s, room: %s)",
+                        device.label,
+                        device.parent_device_id,
+                        device.room_id,
+                    )
+                    related_devices.append(device)
+            
+            # Add sensors for related devices with light sensor capabilities
+            for device in related_devices:
+                try:
+                    components = await st_client.get_device_status(device.device_id)
+                    
+                    # Check for illuminance sensor
+                    if (
+                        "main" in components
+                        and Capability.ILLUMINANCE_MEASUREMENT in components["main"]
+                        and Attribute.ILLUMINANCE in components["main"][Capability.ILLUMINANCE_MEASUREMENT]
+                    ):
+                        _LOGGER.info(
+                            "Adding illuminance sensor for %s (child of %s)",
+                            device.label,
+                            device_name,
+                        )
+                        entities.append(
+                            SmartThingsIlluminanceSensor(
+                                hass=hass,
+                                entry=entry,
+                                session=session,
+                                device_id=device.device_id,
+                                device_name=device.label,
+                                parent_device_id=main_device.device_id,
+                            )
+                        )
+                    
+                    # Check for brightness intensity sensor
+                    if (
+                        "main" in components
+                        and Capability.RELATIVE_BRIGHTNESS in components["main"]
+                        and Attribute.BRIGHTNESS_INTENSITY in components["main"][Capability.RELATIVE_BRIGHTNESS]
+                    ):
+                        _LOGGER.info(
+                            "Adding brightness intensity sensor for %s (child of %s)",
+                            device.label,
+                            device_name,
+                        )
+                        entities.append(
+                            SmartThingsBrightnessIntensitySensor(
+                                hass=hass,
+                                entry=entry,
+                                session=session,
+                                device_id=device.device_id,
+                                device_name=device.label,
+                                parent_device_id=main_device.device_id,
+                            )
+                        )
+                    
+                    if (
+                        "main" not in components
+                        or (
+                            Capability.ILLUMINANCE_MEASUREMENT not in components["main"]
+                            and Capability.RELATIVE_BRIGHTNESS not in components["main"]
+                        )
+                    ):
+                        _LOGGER.debug(
+                            "Device %s does not have light sensor capabilities",
+                            device.label,
+                        )
+                except Exception as ex:
+                    _LOGGER.warning(
+                        "Error checking device %s: %s", device.label, ex
+                    )
+            
+            if not related_devices:
+                _LOGGER.debug(
+                    "No child devices found for %s (device_id: %s)",
+                    device_name,
+                    device_id,
+                )
+        except Exception as ex:
+            _LOGGER.warning("Could not setup SmartThings sensors: %s", ex)
     
-    # Create the sensor entity immediately (don't wait for first refresh)
-    # The coordinator will update data in the background
-    async_add_entities([
-        FrameArtSensor(coordinator, entry, art_api, device_name),
-    ])
-    
-    # Schedule first refresh in background (non-blocking)
-    hass.async_create_background_task(
-        coordinator.async_request_refresh(),
-        f"frame_art_initial_refresh_{entry.entry_id}",
-    )
+    if entities:
+        async_add_entities(entities)
 
 
 class FrameArtCoordinator(DataUpdateCoordinator):
@@ -129,10 +275,40 @@ class FrameArtCoordinator(DataUpdateCoordinator):
         # Enabled by default - thumbnails are fetched for current artwork
         self._thumbnail_fetch_enabled = True
         self._thumbnail_failures = 0
+        
+        # Connection failure tracking to prevent infinite reconnection loops
+        self._connection_failures = 0
+        self._max_connection_failures = 5
+        self._backoff_until: float | None = None
+        
         _LOGGER.info("Frame Art Coordinator initialized with thumbnail fetching enabled")
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the Frame TV."""
+        # Check if we're in backoff period (after multiple connection failures)
+        if self._backoff_until is not None:
+            if time.time() < self._backoff_until:
+                # Still in backoff period, skip update
+                _LOGGER.debug(
+                    "Frame Art: Skipping update due to connection backoff (%.0fs remaining)",
+                    self._backoff_until - time.time()
+                )
+                # Return minimal data during backoff
+                return {
+                    "art_mode": "unavailable",
+                    "current_artwork": None,
+                    "artwork_count": None,
+                    "slideshow_status": None,
+                    "api_version": None,
+                    "current_thumbnail_url": None,
+                    "tv_powered_off": False,
+                }
+            else:
+                # Backoff period expired, reset and try again
+                _LOGGER.info("Frame Art: Backoff period expired, resuming updates")
+                self._backoff_until = None
+                self._connection_failures = 0
+        
         data = {
             "art_mode": None,
             "current_artwork": None,
@@ -140,7 +316,25 @@ class FrameArtCoordinator(DataUpdateCoordinator):
             "slideshow_status": None,
             "api_version": None,
             "current_thumbnail_url": None,
+            "tv_powered_off": False,
         }
+        
+        # FIRST: Check if TV is powered off
+        if self._is_tv_powered_off():
+            _LOGGER.debug("Frame Art: TV is powered off, returning minimal data")
+            data["tv_powered_off"] = True
+            data["art_mode"] = "off"
+            # Keep current_thumbnail_url from last known state (for Lovelace display)
+            if self._has_current_thumbnail():
+                data["current_thumbnail_url"] = "/local/frame_art/current.jpg"
+            # Keep artwork_count from previous data if available
+            if self.data and self.data.get("artwork_count") is not None:
+                data["artwork_count"] = self.data["artwork_count"]
+            # Keep current_artwork (current_content_id) from previous data for Lovelace
+            if self.data and self.data.get("current_artwork"):
+                data["current_artwork"] = self.data["current_artwork"]
+            # Return immediately with minimal data when TV is off
+            return data
         
         try:
             # First, try to get art_mode from media_player state (more reliable)
@@ -235,10 +429,66 @@ class FrameArtCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Error getting slideshow status: %s", ex)
                 
         except Exception as ex:
-            _LOGGER.warning("Error updating Frame Art data: %s", ex)
+            # Track connection failures to prevent infinite reconnection loops
+            error_msg = str(ex).lower()
+            is_connection_error = any(
+                keyword in error_msg
+                for keyword in ["connect", "timeout", "closed", "transport"]
+            )
+            
+            if is_connection_error:
+                self._connection_failures += 1
+                _LOGGER.warning(
+                    "Frame Art: Connection error (%d/%d): %s",
+                    self._connection_failures,
+                    self._max_connection_failures,
+                    ex
+                )
+                
+                # If too many consecutive failures, enter backoff period
+                if self._connection_failures >= self._max_connection_failures:
+                    # Exponential backoff: 5 minutes, then 15 minutes, then 30 minutes
+                    backoff_minutes = min(5 * (2 ** (self._connection_failures - self._max_connection_failures)), 30)
+                    self._backoff_until = time.time() + (backoff_minutes * 60)
+                    _LOGGER.warning(
+                        "Frame Art: Too many connection failures (%d), "
+                        "entering %d minute backoff period. "
+                        "Frame Art sensor will pause updates until backoff expires.",
+                        self._connection_failures,
+                        backoff_minutes
+                    )
+            else:
+                _LOGGER.warning("Frame Art: Error updating data: %s", ex)
+            
             # Don't raise UpdateFailed, just return partial data
+        else:
+            # Update successful, reset failure counter
+            if self._connection_failures > 0:
+                _LOGGER.info("Frame Art: Update successful, resetting failure counter")
+                self._connection_failures = 0
             
         return data
+
+    def _is_tv_powered_off(self) -> bool:
+        """Check if the TV (media_player) is powered off."""
+        try:
+            # Find media_player entity for this config entry
+            from homeassistant.helpers import entity_registry as er
+            entity_registry = er.async_get(self._hass)
+            
+            for entity in entity_registry.entities.values():
+                if (
+                    entity.config_entry_id == self._entry.entry_id
+                    and entity.domain == "media_player"
+                ):
+                    state = self._hass.states.get(entity.entity_id)
+                    if state:
+                        # TV is powered off if media_player state is "off" or "unavailable"
+                        return state.state in ("off", "unavailable")
+                    break
+        except Exception as ex:
+            _LOGGER.debug("Could not check media_player power state: %s", ex)
+        return False
 
     def _get_media_player_art_mode(self) -> str | None:
         """Get art_mode_status from the linked media_player entity."""
@@ -522,11 +772,35 @@ class FrameArtSensor(CoordinatorEntity, SensorEntity):
         if self.coordinator.data:
             data = self.coordinator.data
             
+            # If TV is powered off, return minimal attributes
+            if data.get("tv_powered_off", False):
+                attrs["art_mode_status"] = "off"
+                # Keep artwork_count if we have it (from last time TV was on)
+                if data.get("artwork_count") is not None:
+                    attrs["artwork_count"] = data["artwork_count"]
+                # Keep current_thumbnail_url for Lovelace display
+                if data.get("current_thumbnail_url"):
+                    attrs["current_thumbnail_url"] = data["current_thumbnail_url"]
+                # Keep current_content_id for Lovelace display
+                if data.get("current_artwork"):
+                    current = data["current_artwork"]
+                    content_id = current.get("content_id")
+                    if content_id:
+                        attrs["current_content_id"] = content_id
+                # Add indicator that TV is off
+                attrs["tv_power_state"] = "off"
+                # Thumbnail auto-fetch status
+                attrs["thumbnail_auto_fetch"] = self.coordinator._thumbnail_fetch_enabled
+                return attrs
+            
+            # TV is on - return full attributes
+            attrs["tv_power_state"] = "on"
+            
             # Art mode status
             if data.get("art_mode") is not None:
                 attrs["art_mode_status"] = data["art_mode"]
             
-            # Current artwork details
+            # Current artwork details (only when TV is on)
             if data.get("current_artwork"):
                 current = data["current_artwork"]
                 content_id = current.get("content_id")
@@ -812,3 +1086,183 @@ class FrameArtSensor(CoordinatorEntity, SensorEntity):
         self._last_service_result = result
         self.async_write_ha_state()
         return result
+
+
+class SmartThingsIlluminanceSensor(SensorEntity):
+    """Samsung Frame TV light sensor via SmartThings."""
+
+    _attr_device_class = SensorDeviceClass.ILLUMINANCE
+    _attr_native_unit_of_measurement = LIGHT_LUX
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_has_entity_name = True
+    _attr_translation_key = "illuminance"
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        session,  # aiohttp session
+        device_id: str,
+        device_name: str,
+        parent_device_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        self.hass = hass
+        self._entry = entry
+        self._session = session
+        self._device_id = device_id
+        self._device_name = device_name
+        self._parent_device_id = parent_device_id
+        self._attr_unique_id = f"{device_id}_illuminance"
+        self._attr_native_value = None
+
+    async def _get_st_client(self):
+        """Get SmartThings client with current token from config entry."""
+        from pysmartthings import SmartThings
+        
+        api_key = await async_get_samsungtv_api_key(self.hass, self._entry)
+        
+        if not api_key:
+            config = self.hass.data[DOMAIN][self._entry.entry_id][DATA_CFG]
+            api_key = config.get(CONF_API_KEY)
+            if not api_key:
+                oauth_token = config.get(CONF_OAUTH_TOKEN)
+                if oauth_token and isinstance(oauth_token, dict):
+                    api_key = oauth_token.get("access_token")
+        
+        if not api_key:
+            return None
+            
+        st_client = SmartThings(session=self._session)
+        st_client.authenticate(api_key)
+        return st_client
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device info - link to parent TV device."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._parent_device_id)},
+            name=self._device_name,
+            manufacturer="Samsung",
+            model="Frame TV Light Sensor",
+        )
+
+    @property
+    def name(self) -> str:
+        """Return the name of the sensor."""
+        return "Light Level"
+
+    async def async_update(self) -> None:
+        """Update the sensor value from SmartThings."""
+        try:
+            st_client = await self._get_st_client()
+            if not st_client:
+                return
+                
+            components = await st_client.get_device_status(self._device_id)
+            
+            if (
+                "main" in components
+                and Capability.ILLUMINANCE_MEASUREMENT in components["main"]
+                and Attribute.ILLUMINANCE in components["main"][Capability.ILLUMINANCE_MEASUREMENT]
+            ):
+                illuminance_status = components["main"][Capability.ILLUMINANCE_MEASUREMENT][Attribute.ILLUMINANCE]
+                self._attr_native_value = illuminance_status.value
+                _LOGGER.debug(
+                    "Updated illuminance sensor for %s: %s lux",
+                    self._device_name,
+                    self._attr_native_value,
+                )
+            else:
+                _LOGGER.debug("Illuminance data not available for %s", self._device_name)
+        except Exception as ex:
+            _LOGGER.warning("Error updating illuminance sensor: %s", ex)
+
+
+class SmartThingsBrightnessIntensitySensor(SensorEntity):
+    """Samsung Frame TV brightness intensity sensor via SmartThings."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_has_entity_name = True
+    _attr_translation_key = "brightness_intensity"
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        session,  # aiohttp session
+        device_id: str,
+        device_name: str,
+        parent_device_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        self.hass = hass
+        self._entry = entry
+        self._session = session
+        self._device_id = device_id
+        self._device_name = device_name
+        self._parent_device_id = parent_device_id
+        self._attr_unique_id = f"{device_id}_brightness_intensity"
+        self._attr_native_value = None
+
+    async def _get_st_client(self):
+        """Get SmartThings client with current token from config entry."""
+        from pysmartthings import SmartThings
+        
+        api_key = await async_get_samsungtv_api_key(self.hass, self._entry)
+        
+        if not api_key:
+            config = self.hass.data[DOMAIN][self._entry.entry_id][DATA_CFG]
+            api_key = config.get(CONF_API_KEY)
+            if not api_key:
+                oauth_token = config.get(CONF_OAUTH_TOKEN)
+                if oauth_token and isinstance(oauth_token, dict):
+                    api_key = oauth_token.get("access_token")
+        
+        if not api_key:
+            return None
+            
+        st_client = SmartThings(session=self._session)
+        st_client.authenticate(api_key)
+        return st_client
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device info - link to parent TV device."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._parent_device_id)},
+            name=self._device_name,
+            manufacturer="Samsung",
+            model="Frame TV Light Sensor",
+        )
+
+    @property
+    def name(self) -> str:
+        """Return the name of the sensor."""
+        return "Brightness Intensity"
+
+    async def async_update(self) -> None:
+        """Update the sensor value from SmartThings."""
+        try:
+            st_client = await self._get_st_client()
+            if not st_client:
+                return
+                
+            components = await st_client.get_device_status(self._device_id)
+            
+            if (
+                "main" in components
+                and Capability.RELATIVE_BRIGHTNESS in components["main"]
+                and Attribute.BRIGHTNESS_INTENSITY in components["main"][Capability.RELATIVE_BRIGHTNESS]
+            ):
+                brightness_status = components["main"][Capability.RELATIVE_BRIGHTNESS][Attribute.BRIGHTNESS_INTENSITY]
+                self._attr_native_value = brightness_status.value
+                _LOGGER.debug(
+                    "Updated brightness intensity sensor for %s: %s",
+                    self._device_name,
+                    self._attr_native_value,
+                )
+            else:
+                _LOGGER.debug("Brightness intensity data not available for %s", self._device_name)
+        except Exception as ex:
+            _LOGGER.warning("Error updating brightness intensity sensor: %s", ex)

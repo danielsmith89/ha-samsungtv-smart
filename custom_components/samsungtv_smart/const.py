@@ -72,6 +72,17 @@ CONF_WS_NAME = "ws_name"
 # for SmartThings integration api key usage
 CONF_ST_ENTRY_UNIQUE_ID = "st_entry_unique_id"
 CONF_USE_ST_INT_API_KEY = "use_st_int_api_key"  # obsolete used for migration
+CONF_API_KEY = "api_key"
+CONF_DEVICE_ID = "device_id"
+
+# OAuth2 authentication
+CONF_AUTH_METHOD = "auth_method"
+CONF_OAUTH_TOKEN = "oauth_token"
+
+# Authentication methods
+AUTH_METHOD_OAUTH = "oauth"
+AUTH_METHOD_PAT = "pat"
+AUTH_METHOD_ST_ENTRY = "st_entry"
 
 # obsolete
 CONF_UPDATE_METHOD = "update_method"

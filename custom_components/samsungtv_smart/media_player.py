@@ -7,8 +7,9 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from enum import Enum
 import logging
+import os
 from socket import error as socketError
-from time import sleep
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -49,7 +50,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import DOMAIN as HA_DOMAIN, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import config_validation as cv, entity_platform
+from homeassistant.helpers import config_validation as cv, entity_platform, config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.service import CONF_SERVICE_ENTITY_ID, async_call_from_config
@@ -57,7 +58,7 @@ from homeassistant.helpers.storage import STORAGE_DIR
 from homeassistant.util import Throttle, dt as dt_util
 from homeassistant.util.async_ import run_callback_threadsafe
 
-from . import get_smartthings_api_key
+from . import get_smartthings_api_key, async_get_samsungtv_api_key, get_oauth_refresh_lock, is_oauth_refresh_in_progress, set_oauth_refresh_in_progress
 from .api.samsungcast import SamsungCastTube
 from .api.samsungws import ArtModeStatus, SamsungTVAsyncRest, SamsungTVWS
 from .api.smartthings import SmartThingsTV, STStatus
@@ -76,13 +77,18 @@ from .const import (
     ATTR_SHOW,
     ATTR_SHUFFLE,
     ATTR_STATUS,
+    AUTH_METHOD_OAUTH,
+    AUTH_METHOD_PAT,
+    AUTH_METHOD_ST_ENTRY,
     CONF_APP_LAUNCH_METHOD,
     CONF_APP_LIST,
     CONF_APP_LOAD_METHOD,
+    CONF_AUTH_METHOD,
     CONF_CHANNEL_LIST,
     CONF_DUMP_APPS,
     CONF_EXT_POWER_ENTITY,
     CONF_LOGO_OPTION,
+    CONF_OAUTH_TOKEN,
     CONF_PING_PORT,
     CONF_POWER_ON_METHOD,
     CONF_SHOW_CHANNEL_NR,
@@ -184,6 +190,7 @@ SUPPORT_SAMSUNGTV_SMART = (
 
 MIN_TIME_BETWEEN_ST_UPDATE = timedelta(seconds=5)
 ST_API_KEY_UPDATE_INTERVAL = timedelta(minutes=30)
+OAUTH_TOKEN_REFRESH_BUFFER = 300  # Refresh OAuth token 5 minutes before expiration
 SCAN_INTERVAL = timedelta(seconds=15)
 
 _LOGGER = logging.getLogger(__name__)
@@ -285,6 +292,8 @@ async def async_setup_entry(
             vol.Optional(ATTR_CATEGORY_ID): cv.string,
             vol.Optional("favorites_only", default=False): cv.boolean,
             vol.Optional("personal_only", default=False): cv.boolean,
+            vol.Optional("force_download", default=False): cv.boolean,
+            vol.Optional("cleanup_orphans", default=False): cv.boolean,
         },
         "async_art_get_thumbnails_batch",
     )
@@ -397,6 +406,8 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         super().__init__(config, entry_id)
 
         self._entry_data = entry_data
+        self._entry_id = entry_id
+        self._update_token_func = update_token_func
         self._host = config[CONF_HOST]
 
         # Set entity attributes
@@ -493,16 +504,44 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
 
         # smartthings initialization
         st_entry_uniqueid: str | None = config.get(CONF_ST_ENTRY_UNIQUE_ID)
+        auth_method: str | None = config.get(CONF_AUTH_METHOD)
+        
+        # Store auth method for later use
+        self._auth_method = auth_method
 
         def api_key_callback() -> str | None:
-            """Get new api key and update config entry with the new token."""
+            """Get current api key - for OAuth, read from entry data after refresh."""
+            if self._auth_method == AUTH_METHOD_OAUTH:
+                # For OAuth, always read from entry data to get refreshed token
+                entry = self.hass.config_entries.async_get_entry(self._entry_id)
+                if entry:
+                    oauth_token = entry.data.get(CONF_OAUTH_TOKEN)
+                    if oauth_token and isinstance(oauth_token, dict):
+                        new_token = oauth_token.get("access_token")
+                        if new_token and new_token != self._st_api_key:
+                            _LOGGER.debug("OAuth token updated from entry data")
+                            self._st_api_key = new_token
+                            return new_token
+                return self._st_api_key
             return self._update_smartthing_token(st_entry_uniqueid, update_token_func)
 
         self._st = None
         self._st_api_key = config.get(CONF_API_KEY)
         device_id = config.get(CONF_DEVICE_ID)
+        
+        # For OAuth method, get token from oauth_token if api_key is not set
+        if auth_method == AUTH_METHOD_OAUTH and not self._st_api_key:
+            oauth_token = config.get(CONF_OAUTH_TOKEN)
+            if oauth_token and isinstance(oauth_token, dict):
+                self._st_api_key = oauth_token.get("access_token")
+                _LOGGER.debug("Using OAuth access token for SmartThings API")
+        
         if self._st_api_key and device_id:
-            use_callbck: bool = st_entry_uniqueid is not None
+            # Use callback for both ST_ENTRY and OAuth methods
+            use_callbck: bool = (
+                (auth_method == AUTH_METHOD_ST_ENTRY and st_entry_uniqueid is not None)
+                or auth_method == AUTH_METHOD_OAUTH
+            )
             self._st = SmartThingsTV(
                 api_key=self._st_api_key,
                 device_id=device_id,
@@ -535,7 +574,16 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
     def _update_smartthing_token(
         self, st_unique_id: str, update_token_func: Callable[[str, str], None]
     ) -> str | None:
-        """Update the smartthing token when change on native integration."""
+        """Update the smartthing token when change on native integration.
+        
+        Note: For OAuth method, this function should not be called as the token
+        is managed by Home Assistant's OAuth flow. The callback is disabled for OAuth.
+        """
+        # For OAuth, token refresh is handled elsewhere
+        if self._auth_method == AUTH_METHOD_OAUTH:
+            _LOGGER.debug("OAuth token refresh handled by HA OAuth flow")
+            return self._st_api_key
+            
         _LOGGER.debug("Trying to update smartthing access token")
         if not (new_token := get_smartthings_api_key(self.hass, st_unique_id)):
             _LOGGER.warning(
@@ -550,6 +598,160 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
             self._st_api_key = new_token
 
         return self._st_api_key
+
+    async def _async_refresh_oauth_token(self) -> bool:
+        """Refresh OAuth token if needed.
+        
+        Returns True if token was refreshed or is still valid, False on error.
+        """
+        if self._auth_method != AUTH_METHOD_OAUTH:
+            return True
+        
+        # Check if another refresh is already in progress (global check)
+        if is_oauth_refresh_in_progress(self._entry_id):
+            _LOGGER.debug("OAuth refresh already in progress (global), waiting for result")
+            # Wait a bit and then check if token was refreshed
+            await asyncio.sleep(0.5)
+            # Re-read token from entry
+            entry = self.hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                oauth_token = entry.data.get(CONF_OAUTH_TOKEN, {})
+                new_token = oauth_token.get("access_token")
+                if new_token and new_token != self._st_api_key:
+                    self._st_api_key = new_token
+                    if self._st:
+                        self._st._api_key = new_token
+                        self._st._st.authenticate(new_token)
+                    return True
+            return False
+        
+        # Acquire global lock
+        lock = get_oauth_refresh_lock(self._entry_id)
+        async with lock:
+            # Double-check after acquiring lock - another entity might have refreshed
+            entry = self.hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                oauth_token = entry.data.get(CONF_OAUTH_TOKEN, {})
+                expires_at = oauth_token.get("expires_at", 0)
+                if expires_at > time.time() + OAUTH_TOKEN_REFRESH_BUFFER:
+                    # Token was refreshed by another entity
+                    new_token = oauth_token.get("access_token")
+                    if new_token and new_token != self._st_api_key:
+                        _LOGGER.debug("Token was refreshed by another entity, using new token")
+                        self._st_api_key = new_token
+                        if self._st:
+                            self._st._api_key = new_token
+                            self._st._st.authenticate(new_token)
+                    return True
+            
+            set_oauth_refresh_in_progress(self._entry_id, True)
+            try:
+                return await self._do_oauth_refresh()
+            finally:
+                set_oauth_refresh_in_progress(self._entry_id, False)
+    
+    async def _do_oauth_refresh(self) -> bool:
+        """Perform the actual OAuth token refresh."""
+        # Get current entry to check token expiration
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if not entry:
+            _LOGGER.warning("Could not find config entry for OAuth refresh")
+            return False
+            
+        oauth_token = entry.data.get(CONF_OAUTH_TOKEN)
+        if not oauth_token or not isinstance(oauth_token, dict):
+            _LOGGER.warning("No OAuth token found in config entry")
+            return False
+        
+        # Check if refresh_token exists
+        if "refresh_token" not in oauth_token:
+            _LOGGER.warning(
+                "OAuth token does not contain refresh_token - token cannot be refreshed. "
+                "Please reconfigure the integration with OAuth."
+            )
+            return False
+            
+        expires_at = oauth_token.get("expires_at", 0)
+        current_time = time.time()
+        
+        # Check if token needs refresh (within buffer period before expiration)
+        if expires_at and current_time < (expires_at - OAUTH_TOKEN_REFRESH_BUFFER):
+            # Token still valid, no refresh needed
+            return True
+        
+        # Token is expiring or expired
+        time_until_expiry = expires_at - current_time if expires_at else 0
+        _LOGGER.warning(
+            "OAuth token %s (expires in %.0f seconds), attempting refresh",
+            "expired" if time_until_expiry <= 0 else "expiring soon",
+            time_until_expiry
+        )
+        
+        try:
+            # Try to get implementation from entry
+            implementation = None
+            try:
+                implementation = await config_entry_oauth2_flow.async_get_config_entry_implementation(
+                    self.hass, entry
+                )
+            except Exception as ex:
+                _LOGGER.debug("Could not get implementation from entry: %s", ex)
+            
+            # If not found, try to get it directly from available implementations
+            if not implementation:
+                _LOGGER.debug("Attempting to get OAuth implementation directly")
+                try:
+                    implementations = await config_entry_oauth2_flow.async_get_implementations(
+                        self.hass, DOMAIN
+                    )
+                    if implementations:
+                        # Use the first available implementation
+                        implementation = list(implementations.values())[0]
+                        _LOGGER.debug("Found OAuth implementation: %s", type(implementation).__name__)
+                except Exception as impl_ex:
+                    _LOGGER.debug("Could not get implementations: %s", impl_ex)
+            
+            if not implementation:
+                _LOGGER.error(
+                    "Could not get OAuth implementation - Application Credentials may be missing. "
+                    "Go to Settings > Devices & Services > Application Credentials "
+                    "and add credentials for Samsung TV Smart, then reconfigure the integration."
+                )
+                return False
+                
+            new_token = await implementation.async_refresh_token(oauth_token)
+            
+            # Update config entry with new token and auth_implementation
+            self.hass.config_entries.async_update_entry(
+                entry,
+                data={
+                    **entry.data,
+                    CONF_OAUTH_TOKEN: new_token,
+                    CONF_API_KEY: new_token["access_token"],
+                    "auth_implementation": DOMAIN,
+                },
+            )
+            
+            # Update local api key
+            self._st_api_key = new_token["access_token"]
+            
+            # Update SmartThingsTV directly (callback is disabled for OAuth)
+            if self._st:
+                self._st._api_key = self._st_api_key
+                self._st._st.authenticate(self._st_api_key)
+                _LOGGER.debug("Updated SmartThingsTV with new OAuth token")
+                
+            _LOGGER.info("OAuth token refreshed successfully, new expiration in %.0f seconds", 
+                        new_token.get("expires_at", 0) - time.time())
+            return True
+            
+        except Exception as ex:
+            _LOGGER.error(
+                "Failed to refresh OAuth token: %s. "
+                "You may need to reconfigure the integration with OAuth.",
+                ex
+            )
+            return False
 
     async def async_added_to_hass(self):
         """Set config parameter when add to hass."""
@@ -568,6 +770,10 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
 
         self._ws.register_status_callback(update_status_callback)
         await self.hass.async_add_executor_job(self._ws.start_poll)
+        
+        # Load SmartThings sources if configured
+        if self._st:
+            self._get_st_sources()
 
     async def async_will_remove_from_hass(self):
         """Run when entity will be removed from hass."""
@@ -734,9 +940,9 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
 
     def _get_st_sources(self):
         """Get sources from SmartThings."""
-        if self._state != MediaPlayerState.ON or not self._st:
+        if not self._st:
             _LOGGER.debug(
-                "Samsung TV is OFF or SmartThings not configured, _get_st_sources not executed"
+                "SmartThings not configured, _get_st_sources not executed"
             )
             return
 
@@ -851,8 +1057,10 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
 
         if self._st.source in ["digitalTv", "TV"]:
             cloud_key = "ST_TV"
-        else:
+        elif self._st.source:
             cloud_key = "ST_" + self._st.source
+        else:
+            cloud_key = None
 
         found_source = self._running_app
         for attr, value in self._source_list.items():
@@ -976,6 +1184,10 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
 
     async def async_update(self):
         """Update state of device."""
+
+        # Refresh OAuth token if needed (before any SmartThings API call)
+        if self._auth_method == AUTH_METHOD_OAUTH:
+            await self._async_refresh_oauth_token()
 
         # Required to get source and media title
         st_error: bool | None = None
@@ -1172,15 +1384,15 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         if self._running_app == DEFAULT_APP:
             if self._st and self._st.state != STStatus.STATE_OFF:
                 if self._st.source in ["digitalTv", "TV"]:
-                    if self._st.channel_name != "":
-                        if self._show_channel_number and self._st.channel != "":
+                    if self._st.channel_name and self._st.channel_name != "":
+                        if self._show_channel_number and self._st.channel and self._st.channel != "":
                             return self._st.channel_name + " (" + self._st.channel + ")"
                         return self._st.channel_name
-                    if self._st.channel != "":
+                    if self._st.channel and self._st.channel != "":
                         return self._st.channel
                     return None
 
-                if (run_app := self._st.channel_name) != "":
+                if (run_app := self._st.channel_name) and run_app != "":
                     # the channel name holds the running app ID
                     # regardless of the self._cloud_source value
                     # if the app ID is in the configured apps but is not running_app,
@@ -1352,7 +1564,7 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         send_success = False
         for i in range(wol_repeat):
             if i > 0:
-                sleep(0.25)
+                time.sleep(0.25)
             try:
                 send_magic_packet(self._mac, ip_address=ip_address)
                 send_success = True
@@ -1630,7 +1842,7 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         def send_digit():
             for digit in channel_no:
                 self.send_command("KEY_" + digit)
-                sleep(KEYPRESS_DEFAULT_DELAY)
+                time.sleep(KEYPRESS_DEFAULT_DELAY)
             self.send_command("KEY_ENTER")
 
         await self.hass.async_add_executor_job(send_digit)
@@ -1968,31 +2180,99 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
             return result
 
     async def _ensure_art_mode_ready(self) -> bool:
-        """Ensure TV is on and in Art Mode. Turn it on if needed.
+        """Ensure TV is on and in Art Mode. Turn it on and activate Art Mode if needed.
+        
+        Uses SmartThings as fallback if WebSocket connection fails.
         
         Returns:
-            bool: True if TV is ready, False if failed to turn on
+            bool: True if TV is ready in Art Mode, False if failed
         """
-        # If TV is NOT off, assume it's ready
-        if self.state != MediaPlayerState.OFF:
-            _LOGGER.debug("Frame Art: TV appears to be on (state=%s), proceeding", self.state)
-            return True
+        # Check if TV is off, turn it on if needed
+        if self.state == MediaPlayerState.OFF:
+            _LOGGER.info("Frame Art: TV is off, turning it on first...")
+            
+            try:
+                # Try normal WebSocket turn on first
+                await self.async_turn_on()
+                
+                # Wait for TV to power up and be ready
+                _LOGGER.debug("Frame Art: Waiting for TV to be ready...")
+                await asyncio.sleep(10)  # Wait for full TV startup
+                
+                _LOGGER.info("Frame Art: TV should now be on")
+                
+            except Exception as ex:
+                # WebSocket failed, try SmartThings fallback
+                if "1005" in str(ex) or "saturated" in str(ex).lower() or "closed" in str(ex).lower():
+                    _LOGGER.warning(
+                        "Frame Art: WebSocket connection failed (TV may be in sleep mode), "
+                        "trying SmartThings fallback..."
+                    )
+                    
+                    # Try SmartThings if available
+                    if self._st:
+                        try:
+                            await self._st.async_turn_on()
+                            _LOGGER.info("Frame Art: TV turned on via SmartThings")
+                            
+                            # Wait longer for TV to wake from sleep mode
+                            _LOGGER.debug("Frame Art: Waiting for TV to wake up...")
+                            await asyncio.sleep(15)
+                            
+                            _LOGGER.info("Frame Art: TV should now be on (via SmartThings)")
+                            
+                        except Exception as st_ex:
+                            _LOGGER.error("Frame Art: SmartThings fallback also failed: %s", st_ex)
+                            return False
+                    else:
+                        _LOGGER.error("Frame Art: SmartThings not configured, cannot use fallback")
+                        return False
+                else:
+                    _LOGGER.error("Frame Art: Failed to turn on TV: %s", ex)
+                    return False
         
-        # TV is off, need to turn it on first
-        _LOGGER.info("Frame Art: TV is off, turning it on first...")
+        # TV is now on (or was already on), check if Art Mode is active
+        _LOGGER.debug("Frame Art: TV is on, checking if Art Mode is active...")
+        
         try:
-            # Turn on the TV using the standard turn_on method
-            await self.async_turn_on()
+            # Check current Art Mode status
+            async with asyncio.timeout(8):
+                art_mode_status = await self._art_api.get_artmode()
             
-            # Wait for TV to power up and be ready
-            _LOGGER.debug("Frame Art: Waiting for TV to be ready...")
-            await asyncio.sleep(10)  # Wait longer for full TV startup
+            if art_mode_status == "on":
+                _LOGGER.debug("Frame Art: Art Mode already active")
+                return True
             
-            _LOGGER.info("Frame Art: TV should now be ready")
-            return True
-        except Exception as ex:
-            _LOGGER.error("Frame Art: Failed to turn on TV: %s", ex)
+            # Art Mode is not active, activate it
+            _LOGGER.info("Frame Art: Art Mode is OFF, activating it...")
+            async with asyncio.timeout(10):
+                result = await self._art_api.set_artmode(True)
+            
+            if result:
+                _LOGGER.info("Frame Art: Art Mode successfully activated")
+                # Wait a bit for Art Mode to fully activate
+                await asyncio.sleep(2)
+                return True
+            else:
+                _LOGGER.error("Frame Art: Failed to activate Art Mode")
+                return False
+                
+        except asyncio.TimeoutError:
+            _LOGGER.error("Frame Art: Timeout checking/activating Art Mode")
             return False
+        except Exception as ex:
+            _LOGGER.error("Frame Art: Error ensuring Art Mode: %s", ex)
+            return False
+
+    async def _force_art_coordinator_refresh(self):
+        """Force immediate refresh of Frame Art coordinator after artwork changes."""
+        try:
+            coordinator = self.hass.data[DOMAIN][self._entry_id].get("frame_art_coordinator")
+            if coordinator:
+                await coordinator.async_request_refresh()
+                _LOGGER.debug("Forced Frame Art coordinator refresh")
+        except Exception as ex:
+            _LOGGER.debug("Could not force coordinator refresh: %s", ex)
 
     async def async_art_select_image(
         self,
@@ -2012,6 +2292,10 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         # Select the artwork
         try:
             await self._art_api.select_image(content_id, category_id, show)
+            
+            # Force immediate update 🚀
+            await self._force_art_coordinator_refresh()
+            
             return {"success": True, "content_id": content_id}
         except Exception as ex:
             _LOGGER.error("Error selecting artwork: %s", ex)
@@ -2058,6 +2342,10 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
             )
             if content_id:
                 _LOGGER.info("Frame Art: Upload successful, content_id=%s", content_id)
+                
+                # Force immediate update 🚀
+                await self._force_art_coordinator_refresh()
+                
                 return {"success": True, "content_id": content_id}
             
             _LOGGER.error("Frame Art: Upload failed - no content_id returned")
@@ -2077,6 +2365,10 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
             return {"error": "Can only delete user-uploaded content (MY-*)"}
         try:
             await self._art_api.delete(content_id)
+            
+            # Force immediate update 🚀
+            await self._force_art_coordinator_refresh()
+            
             return {"success": True}
         except Exception as ex:
             _LOGGER.error("Error deleting artwork: %s", ex)
@@ -2206,12 +2498,106 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
             self._store_art_result(result)
             return result
 
+    async def _cleanup_orphan_thumbnails(
+        self,
+        valid_content_ids: set,
+        favorites_only: bool = False,
+        personal_only: bool = False,
+        category_id: str | None = None,
+    ) -> list:
+        """Remove local thumbnail files that are no longer in the artwork list.
+        
+        Args:
+            valid_content_ids: Set of content IDs that should be kept
+            favorites_only: If True, only clean store/ directory (favorites are SAM-* images)
+            personal_only: If True, only clean personal/ directory
+            category_id: If set, determine which directory to clean based on category
+            
+        Returns:
+            List of removed file paths
+        """
+        removed_files = []
+        
+        # Determine which directories to clean
+        dirs_to_clean = []
+        base_path = self.hass.config.path("www", "frame_art")
+        
+        if favorites_only:
+            # Favorites are typically SAM-* (store) images
+            dirs_to_clean = [("store", os.path.join(base_path, "store"))]
+        elif personal_only:
+            # Personal photos are MY_F* images
+            dirs_to_clean = [("personal", os.path.join(base_path, "personal"))]
+        elif category_id:
+            # Determine based on category
+            if category_id == "MY-C0002":  # Personal photos
+                dirs_to_clean = [("personal", os.path.join(base_path, "personal"))]
+            elif category_id == "MY-C0004":  # Favorites (mostly store)
+                dirs_to_clean = [("store", os.path.join(base_path, "store"))]
+            else:
+                # Clean all directories for other categories
+                dirs_to_clean = [
+                    ("personal", os.path.join(base_path, "personal")),
+                    ("store", os.path.join(base_path, "store")),
+                    ("other", os.path.join(base_path, "other")),
+                ]
+        else:
+            # Clean all directories
+            dirs_to_clean = [
+                ("personal", os.path.join(base_path, "personal")),
+                ("store", os.path.join(base_path, "store")),
+                ("other", os.path.join(base_path, "other")),
+            ]
+        
+        def _do_cleanup():
+            """Synchronous cleanup function to run in executor."""
+            removed = []
+            for subdir_name, dir_path in dirs_to_clean:
+                if not os.path.exists(dir_path):
+                    continue
+                    
+                try:
+                    for filename in os.listdir(dir_path):
+                        if not filename.endswith(".jpg"):
+                            continue
+                        
+                        # Extract content_id from filename (remove .jpg extension)
+                        content_id = filename[:-4]
+                        
+                        # Check if this content_id is still valid
+                        if content_id not in valid_content_ids:
+                            file_path = os.path.join(dir_path, filename)
+                            try:
+                                os.remove(file_path)
+                                removed.append({
+                                    "content_id": content_id,
+                                    "path": file_path,
+                                    "subdirectory": subdir_name,
+                                })
+                                _LOGGER.info("Removed orphan thumbnail: %s", file_path)
+                            except OSError as ex:
+                                _LOGGER.warning("Failed to remove orphan thumbnail %s: %s", file_path, ex)
+                except OSError as ex:
+                    _LOGGER.warning("Error scanning directory %s: %s", dir_path, ex)
+            
+            return removed
+        
+        try:
+            removed_files = await self.hass.async_add_executor_job(_do_cleanup)
+            if removed_files:
+                _LOGGER.info("Cleaned up %d orphan thumbnail(s)", len(removed_files))
+        except Exception as ex:
+            _LOGGER.error("Error during orphan thumbnail cleanup: %s", ex)
+        
+        return removed_files
+
     async def async_art_get_thumbnails_batch(
         self,
         category_id: str | None = None,
         favorites_only: bool = False,
         personal_only: bool = False,
         force_download: bool = False,
+        cleanup_orphans: bool = False,
     ) -> dict:
         """Download thumbnails for multiple artworks.
         
@@ -2227,7 +2613,7 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         - /config/www/frame_art/other/ for other content types
         
         If force_download=False, skips files that already exist.
-        All content types are treated equally - no DRM protection assumptions.
+        If cleanup_orphans=True, removes local files not in the current artwork list.
         """
         if not await self._ensure_frame_tv_check():
             _LOGGER.warning("Frame TV art mode is not supported on this device")
@@ -2262,13 +2648,21 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
                 self._store_art_result(result)
                 return result
             
+            # Build set of valid content IDs
+            valid_content_ids = {artwork.get("content_id") for artwork in artwork_list if artwork.get("content_id")}
+            
+            # Cleanup orphans if requested
+            removed_files = []
+            if cleanup_orphans:
+                removed_files = await self._cleanup_orphan_thumbnails(valid_content_ids, favorites_only, personal_only, category_id)
+            
             # Download thumbnails with progress tracking
             downloaded = []
             skipped = []
             failed = []
             total = len(artwork_list)
             
-            _LOGGER.info("Starting batch thumbnail download for %d artworks (force_download=%s)", total, force_download)
+            _LOGGER.info("Starting batch thumbnail download for %d artworks (force_download=%s, cleanup_orphans=%s)", total, force_download, cleanup_orphans)
             
             for idx, artwork in enumerate(artwork_list, 1):
                 content_id = artwork.get("content_id")
@@ -2322,22 +2716,26 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
                 "downloaded": len(downloaded),
                 "skipped": len(skipped),
                 "failed": len(failed),
+                "removed": len(removed_files),
                 "downloaded_list": downloaded,
                 "skipped_list": skipped,
                 "failed_list": failed,
+                "removed_list": removed_files,
                 "filters": {
                     "category_id": category_id,
                     "favorites_only": favorites_only,
                     "personal_only": personal_only,
                     "force_download": force_download,
+                    "cleanup_orphans": cleanup_orphans,
                 },
             }
             
             _LOGGER.info(
-                "Batch thumbnail download complete: %d downloaded, %d skipped (already exist), %d failed out of %d total",
+                "Batch thumbnail download complete: %d downloaded, %d skipped (already exist), %d failed, %d removed out of %d total",
                 len(downloaded),
                 len(skipped),
                 len(failed),
+                len(removed_files),
                 total,
             )
             
